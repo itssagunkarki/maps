@@ -1,0 +1,10 @@
+googlemaps
+pandas
+numpy
+jupyter
+python-dotenv
+openpyxl
+pyarrow
+geopandas
+matplotlib
+plotly

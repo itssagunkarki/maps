@@ -1,0 +1,189 @@
+import os
+import dotenv
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import time
+import matplotlib.pyplot as plt
+import geopandas as gpd
+from shapely.geometry import Point
+
+pd.set_option('display.max_columns', 500)
+
+dotenv.load_dotenv()
+
+
+checkout_time_bin_dict = {1: ['T0730_bicycling_(In Minutes)', 'T0730_transit_(In Minutes)'],
+ 2: ['T1200_bicycling_(In Minutes)', 'T1200_transit_(In Minutes)'],
+ 3: ['T1600_bicycling_(In Minutes)', 'T1600_transit_(In Minutes)'],
+ 4: ['T2015_bicycling_(In Minutes)', 'T2015_transit_(In Minutes)']}
+
+
+filterd_data = True
+if not filterd_data:
+    df_merged = pd.read_parquet(os.path.join(os.environ['OUTPUT_PATH'], "Bike_Trips_With_Coordinates_Google.parquet"))
+
+    df_merged.fillna(0, inplace=True)
+    # remove duplicate column
+    df_merged.drop(columns=['Destination_Coordinates', 'Origin_Coordinates'], inplace=True)
+
+    ### we are only interested in checkout_time_bin 1, 2, 3, 4
+    df_merged = df_merged[df_merged['checkout_time_bin'].isin([1,2,3,4])]
+
+    #### Remove all where checkout_Kiosk is the same as return_kiosk
+    df_merged = df_merged[df_merged['Checkout_Kiosk_Coordinates'] != df_merged['Return_Kiosk_Coordinates']]
+
+    df_merged.to_parquet(os.path.join(os.environ['OUTPUT_PATH'], 'data', "Bike_Trips_With_Coordinates_Google_Filtered.parquet"))
+else:
+    df_merged = pd.read_parquet(os.path.join(os.environ['OUTPUT_PATH'], 'data', "Bike_Trips_With_Coordinates_Google_Filtered.parquet"))
+
+already_processed = True  # Change this to True to execute the 'if' block
+
+if not already_processed:
+    gdf = gpd.read_file(os.path.join(os.environ['OUTPUT_PATH'], "nhgis0019_shapefile_tl2020_us_blck_grp_2020/US_blck_grp_2020.shp"))
+
+    nebraska_gdf = gdf[gdf['STATEFP'] == '31']
+
+    nebraska_gdf = nebraska_gdf.to_crs('EPSG:4326')
+
+    douglas_county = nebraska_gdf[nebraska_gdf['COUNTYFP'] == '055']
+    neighboring_counties = nebraska_gdf[nebraska_gdf.touches(douglas_county.unary_union)]
+    # omaha_region_gdf = gpd.GeoDataFrame(pd.concat([douglas_county, neighboring_counties], ignore_index=True))
+    gpd.GeoDataFrame(pd.concat([douglas_county, neighboring_counties], ignore_index=True)).to_file(os.path.join(os.environ['OUTPUT_PATH'], 'omaha_map_data','omaha_region.shp'))
+
+else:
+    omaha_region_gdf = gpd.read_file(os.path.join(os.environ['OUTPUT_PATH'], 'omaha_map_data','omaha_region.shp'))
+
+
+def get_time_bin_data(time_bin: int, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Get the data for a specific time bin with a column `BT_divided_by_TT` added.
+    """
+    df = df[df['checkout_time_bin'] == time_bin].copy()
+
+    ### Go through all the columns in checkout_time_bin_dict and revoe all the columns that are not in the current time bin
+    removing_columns = []
+    for i in checkout_time_bin_dict:
+        if i != time_bin:
+            removing_columns.extend(checkout_time_bin_dict[i])
+    df.drop(columns=removing_columns, inplace=True)
+
+    df['BT_divided_by_TT'] = df[checkout_time_bin_dict[time_bin][0]] / df[checkout_time_bin_dict[time_bin][1]]
+
+    ### fill all the infinities with 0
+    df.replace([np.inf, -np.inf], 0, inplace=True)
+
+    return df
+
+
+def get_avg_bt_tt_ratio(time_bin: int, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Get the average BT divided by TT for each block group.
+    """
+    return df.groupby(by=['Checkout_Kiosk_Coordinates', 'Return_Kiosk_Coordinates', 'Checkout Kiosk','Return Kiosk']).agg({'BT_divided_by_TT': 'mean', f'{checkout_time_bin_dict[time_bin][0]}': "mean", f"{checkout_time_bin_dict[time_bin][1]}": "mean"}).reset_index()
+
+
+def put_geometry_column(df, coordinate_column='Return_Kiosk_Coordinates', crs='EPSG:4326'):
+    """
+    It assumes coordinates is in string format as `latitude, longitude`
+    """
+
+    # Splitting the coordinates into latitude and longitude columns
+    df[['Latitude', 'Longitude']] = df[coordinate_column].str.split(',', expand=True)
+
+    # Converting Latitude and Longitude to float type
+    df['Latitude'] = df['Latitude'].astype(float)
+    df['Longitude'] = df['Longitude'].astype(float)
+
+    # Creating Point geometries
+    geometry = [Point(xy) for xy in zip(df['Longitude'], df['Latitude'])]
+
+    # Creating a GeoDataFrame
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=crs)
+
+    # Dropping the original columns if necessary
+    gdf = gdf.drop(columns=['Latitude', 'Longitude'])
+
+    return gdf
+
+
+def join_with_omaha_area(current_section, omaha_region_gdf):
+    """
+    Join the current section with the omaha region
+    """
+    return gpd.sjoin(omaha_region_gdf, current_section, how='left', predicate='intersects').reset_index().fillna(0)
+
+time_bin = 1
+df_test = get_time_bin_data(time_bin, df_merged)
+df_test = get_avg_bt_tt_ratio(time_bin, df_test)
+
+### We want to chose from one kiosk what is the travel time to all other kiosks, so we need to aggregate the result with return kioks
+df_test = put_geometry_column(df_test, coordinate_column='Return_Kiosk_Coordinates')
+
+
+
+gdf_merged = join_with_omaha_area(df_test, omaha_region_gdf)
+
+
+gdf_merged =  gdf_merged[
+    [
+        'GEOID', 'geometry', 'Checkout Kiosk', 'Return Kiosk', 'BT_divided_by_TT', f'{checkout_time_bin_dict[time_bin][0]}', f'{checkout_time_bin_dict[time_bin][1]}',
+    ]
+].copy()
+
+def get_checkout_kiosk_names():
+    """
+    Get the names of the checkout kiosks
+    """
+    return gdf_merged['Checkout Kiosk'].unique()
+
+
+import plotly.express as px
+
+def join_with_omaha_area(current_section, omaha_region_gdf):
+    """
+    Join the current section with the omaha region
+    """
+    return gpd.sjoin(omaha_region_gdf, current_section, how='left', predicate='intersects').reset_index().fillna(0)
+
+def plot_map(df, column_to_plot, title):
+    """
+    Plot the map using Plotly
+    """
+    fig = px.choropleth_mapbox(df, geojson=df.geometry, locations=df.index, color=column_to_plot,
+                            #    color_continuous_scale=[[0, 'red'], [1, 'blue']],
+                               range_color=[df[column_to_plot].min(), df[column_to_plot].max()],
+                               mapbox_style="carto-positron",
+                               color_continuous_scale="reds",
+                               zoom=10,
+                               opacity=0.5,
+                               hover_name=df['Return Kiosk'],
+                                hover_data={
+                                    'Return Kiosk': True,
+                                    'T0730_bicycling_(In Minutes)': True,
+                                    },
+                            #    labels={column_to_plot: column_to_plot}
+                            )
+    
+    fig.update_layout(
+        title=title,
+        mapbox_style="carto-positron",
+        mapbox_zoom=10,  # Adjust the zoom level as needed
+        mapbox_center={"lat": 41.3148, "lon": -96.1951},  # Centered at Douglas County, Nebraska
+        margin={"r": 0, "t": 0, "l": 0, "b": 0}
+    )
+
+    fig.show()
+
+def plot_selected_kiosk(kiosk_name: str):
+    """
+    Plot the selected kiosk on the map.
+    """
+    current_section = gdf_merged[gdf_merged['Checkout Kiosk'] == '23rd & Cuming']
+
+    plot_map(df=current_section,
+         column_to_plot='BT_divided_by_TT',
+         title='Bike to Transit Ratio')
+    plt.show()
+
+# plot_selected_kiosk('23rd & Cuming')
